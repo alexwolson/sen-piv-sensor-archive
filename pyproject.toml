@@ -1,0 +1,14 @@
+[project]
+name = "amalgamate-steel-flow-data"
+version = "0.1.0"
+description = "Consolidate particle image velocimetry (PIV) velocity fields and paired mould sensor traces for submerged entry nozzle (SEN) experiments"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "h5py>=3.11.0",
+    "numpy>=1.26.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "pyarrow>=16.1.0",
+    "rich>=13.7.0",
+]
