@@ -14,6 +14,9 @@ import csv
 import os
 import re
 import shutil
+import tarfile
+import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,8 +60,8 @@ CANONICAL_FILENAME_RE = re.compile(
 )
 
 LEGACY_FILENAME_RE = re.compile(
-    r"^(?P<date>\d{2}-\d{2}-\d{4})_(?P<sen>SEN\d{2})(?:_(?P<time>\d{3,4}))?"
-    r"_(?P<speed>[\d\.]+(?:mpm)?)_(?P<gas>\d+)LPM_(?P<run>PIV\d+)\.xlsx$",
+    r"^(?P<date>\d{2}-\d{2}-\d{4})_(?P<sen_variant>SEN(?:\d+|[A-Z]\d+))(?:_(?P<variant>[A-Z]\d+))?"
+    r"(?:_(?P<time>\d{3,4}))?_(?P<speed>[\d\.]+(?:mpm)?)_(?P<gas>\d+)LPM_(?P<run>PIV\d+)\.xlsx$",
     re.IGNORECASE,
 )
 
@@ -482,6 +485,221 @@ def write_datasets(
     )
 
 
+def extract_tar_archive(archive_path: Path, temp_dir: Path) -> None:
+    """Extract a tar archive to a temporary directory."""
+    logger.info("Extracting %s", archive_path.name)
+    try:
+        with tarfile.open(archive_path, "r:*") as tar:
+            tar.extractall(temp_dir)
+    except tarfile.TarError as exc:
+        raise ValueError(f"Failed to extract {archive_path}: {exc}") from exc
+
+
+def extract_zip_archive(archive_path: Path, temp_dir: Path) -> None:
+    """Extract a zip archive to a temporary directory."""
+    logger.info("Extracting %s", archive_path.name)
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zipf:
+            zipf.extractall(temp_dir)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Failed to extract {archive_path}: {exc}") from exc
+
+
+def organize_extracted_files(
+    temp_dir: Path,
+    sensor_target: Path,
+    piv_target: Path,
+    archive_name: str,
+) -> None:
+    """Organize extracted files into sensor_logs and piv_velocity_raw directories."""
+    # Determine if this is sensor data (pivdata.tar) or PIV data (SEN*.zip)
+    is_sensor_data = archive_name == "pivdata.tar"
+    
+    if is_sensor_data:
+        target_dir = sensor_target
+        target_suffixes = WORKBOOK_SUFFIXES
+        logger.info("Organizing sensor data from %s", archive_name)
+    else:
+        target_dir = piv_target
+        target_suffixes = {".csv"}
+        logger.info("Organizing PIV data from %s", archive_name)
+    
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find all files in the extracted archive
+    extracted_files = list(temp_dir.rglob("*"))
+    extracted_files = [f for f in extracted_files if f.is_file()]
+    
+    if not extracted_files:
+        logger.warning("No files found in extracted archive %s", archive_name)
+        return
+    
+    # For PIV data, identify top-level directories that contain CSV files
+    # and move entire directory structures
+    if not is_sensor_data:
+        # Find all directories containing CSV files
+        csv_dirs = {}
+        for extracted_file in extracted_files:
+            if extracted_file.suffix.lower() == ".csv":
+                try:
+                    rel_path = extracted_file.relative_to(temp_dir)
+                    # Get the top-level directory in the archive
+                    top_level = rel_path.parts[0] if len(rel_path.parts) > 1 else None
+                    if top_level:
+                        top_dir = temp_dir / top_level
+                        if top_dir.is_dir() and top_dir not in csv_dirs:
+                            csv_dirs[top_dir] = rel_path.parts[0]
+                except ValueError:
+                    continue
+        
+        # Move top-level directories that contain CSVs
+        files_moved = 0
+        for source_dir, top_name in csv_dirs.items():
+            try:
+                target_dir_path = target_dir / top_name
+                if target_dir_path.exists():
+                    # Directory exists, merge contents
+                    for item in source_dir.rglob("*"):
+                        if item.is_file():
+                            try:
+                                rel_item = item.relative_to(source_dir)
+                                target_file = target_dir_path / rel_item
+                                target_file.parent.mkdir(parents=True, exist_ok=True)
+                                if not target_file.exists():
+                                    shutil.move(str(item), str(target_file))
+                                    files_moved += 1
+                            except (ValueError, OSError):
+                                continue
+                else:
+                    # Move the entire directory
+                    target_dir_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source_dir), str(target_dir_path))
+                    # Count files in moved directory
+                    files_moved += sum(1 for _ in target_dir_path.rglob("*") if _.is_file())
+            except (OSError, ValueError) as exc:
+                logger.warning("Failed to move directory %s: %s", source_dir, exc)
+                continue
+        
+        # Also handle individual CSV files not in recognized directories
+        for extracted_file in extracted_files:
+            if extracted_file.suffix.lower() == ".csv":
+                # Check if this file is already under a moved directory
+                already_moved = False
+                for source_dir in csv_dirs:
+                    try:
+                        extracted_file.relative_to(source_dir)
+                        already_moved = True
+                        break
+                    except ValueError:
+                        continue
+                
+                if not already_moved:
+                    try:
+                        rel_path = extracted_file.relative_to(temp_dir)
+                        target_path = target_dir / rel_path
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not target_path.exists():
+                            shutil.move(str(extracted_file), str(target_path))
+                            files_moved += 1
+                    except (ValueError, OSError):
+                        continue
+        
+        logger.info("Organized %d files from %s", files_moved, archive_name)
+    else:
+        # For sensor data, move Excel files preserving directory structure
+        files_moved = 0
+        for extracted_file in extracted_files:
+            if extracted_file.suffix.lower() in target_suffixes:
+                try:
+                    rel_path = extracted_file.relative_to(temp_dir)
+                    target_path = target_dir / rel_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    if not target_path.exists():
+                        shutil.move(str(extracted_file), str(target_path))
+                        files_moved += 1
+                except (ValueError, OSError) as exc:
+                    logger.debug("Skipping file %s: %s", extracted_file, exc)
+                    continue
+        
+        logger.info("Organized %d files from %s", files_moved, archive_name)
+
+
+def extract_archives(
+    raw_data_dir: Path,
+    sensor_target: Path,
+    piv_target: Path,
+    extract_archives: bool = True,
+    rebuild: bool = False,
+) -> None:
+    """Extract and organize archive files from raw_data_dir."""
+    if not extract_archives:
+        logger.info("Archive extraction disabled.")
+        return
+    
+    if not raw_data_dir.exists():
+        logger.warning("Raw data directory does not exist: %s", raw_data_dir)
+        return
+    
+    # Check if target directories already exist and have content
+    sensor_has_content = sensor_target.exists() and any(sensor_target.iterdir())
+    piv_has_content = piv_target.exists() and any(piv_target.iterdir())
+    
+    if sensor_has_content and piv_has_content and not rebuild:
+        logger.info("Target directories already contain files; skipping extraction.")
+        logger.info("Use --rebuild-intermediate to force re-extraction.")
+        return
+    
+    # Find archive files
+    tar_files = list(raw_data_dir.glob("*.tar"))
+    zip_files = list(raw_data_dir.glob("*.zip"))
+    archive_files = tar_files + zip_files
+    
+    if not archive_files:
+        logger.info("No archive files found in %s", raw_data_dir)
+        return
+    
+    logger.info("Found %d archive file(s) in %s", len(archive_files), raw_data_dir)
+    
+    # Create temporary directory for extraction
+    with tempfile.TemporaryDirectory(prefix="sen_piv_extract_") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        
+        for archive_path in sorted(archive_files):
+            archive_name = archive_path.name
+            logger.info("Processing archive: %s", archive_name)
+            
+            # Extract to temporary directory
+            try:
+                if archive_path.suffix.lower() == ".tar":
+                    extract_tar_archive(archive_path, temp_dir)
+                elif archive_path.suffix.lower() == ".zip":
+                    extract_zip_archive(archive_path, temp_dir)
+                else:
+                    logger.warning("Unsupported archive format: %s", archive_path)
+                    continue
+            except Exception as exc:
+                logger.error("Failed to extract %s: %s", archive_name, exc)
+                continue
+            
+            # Organize extracted files
+            try:
+                organize_extracted_files(
+                    temp_dir, sensor_target, piv_target, archive_name
+                )
+            except Exception as exc:
+                logger.error("Failed to organize files from %s: %s", archive_name, exc)
+                continue
+            
+            # Clean up extracted files from temp_dir before next archive
+            for item in temp_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+        
+        logger.info("Archive extraction complete.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=textwrap.dedent(
@@ -578,12 +796,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip regenerating coverage reports.",
     )
+    parser.add_argument(
+        "--raw-data-dir",
+        type=Path,
+        default=Path("data/raw"),
+        help="Directory containing archive files to extract.",
+    )
+    parser.add_argument(
+        "--extract-archives",
+        action="store_true",
+        default=True,
+        help="Extract archive files from raw-data-dir before processing (default: True).",
+    )
+    parser.add_argument(
+        "--no-extract-archives",
+        dest="extract_archives",
+        action="store_false",
+        help="Skip archive extraction.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rebuild = args.rebuild_intermediate
+
+    # Extract archives before processing
+    extract_archives(
+        raw_data_dir=args.raw_data_dir,
+        sensor_target=args.raw_sensor_root,
+        piv_target=args.raw_piv_root,
+        extract_archives=args.extract_archives,
+        rebuild=rebuild,
+    )
 
     normalize_sensor_logs(
         raw_root=args.raw_sensor_root,
@@ -697,16 +942,74 @@ def parse_legacy_sensor(path: Path, rel_parts: Sequence[str]) -> WorkbookRecord:
     if not match:
         raise ValueError(f"Unrecognised workbook filename: {path.name}")
     date_iso = datetime.strptime(match.group("date"), "%m-%d-%Y").date().isoformat()
-    sen = match.group("sen").upper()
+    sen_variant_raw = match.group("sen_variant").upper()
+    
+    # Extract SEN number and variant from sen_variant group
+    # Handle both patterns: SEN7 (just number) or SENL90 (embedded variant)
+    sen_match = re.search(r"SEN(\d+)", sen_variant_raw, re.IGNORECASE)
+    embedded_variant_match = re.search(r"SEN([A-Z])(\d+)", sen_variant_raw, re.IGNORECASE)
+    
+    if sen_match:
+        # Pattern like SEN7 or SEN07
+        sen_num = int(sen_match.group(1))
+        sen = f"SEN{sen_num:02d}"
+    elif embedded_variant_match:
+        # Pattern like SENL90 - try to extract SEN number from path first
+        sen = None
+        # Check path parts for SEN directory (e.g., SEN07, SEN06, etc.)
+        for part in rel_parts:
+            sen_path_match = re.search(r"SEN(\d+)", part, re.IGNORECASE)
+            if sen_path_match:
+                sen_num = int(sen_path_match.group(1))
+                sen = f"SEN{sen_num:02d}"
+                break
+        
+        # If not found in path, use heuristic based on variant
+        # L90 variants are typically SEN07 based on archive naming
+        if sen is None:
+            variant_letter = embedded_variant_match.group(1)
+            variant_num = embedded_variant_match.group(2)
+            if variant_letter.upper() == "L":
+                # L variants (lclog) are typically SEN07
+                sen = "SEN07"
+            else:
+                # Default fallback
+                sen = "SEN07"
+    else:
+        sen = sen_variant_raw
+    
     start = match.group("time")
     speed_slug = clean_speed_slug(match.group("speed"))
     gas_lpm = int(match.group("gas"))
     piv_run = int(re.search(r"(\d+)", match.group("run")).group(1))
+    
+    # Extract variant from filename if present
     variant = "baseline"
-    if len(rel_parts) >= 2:
+    
+    # First check for embedded variant (SENL90 pattern)
+    if embedded_variant_match:
+        variant_letter = embedded_variant_match.group(1).upper()
+        variant_num = embedded_variant_match.group(2)
+        if variant_letter == "L":
+            variant = f"lclog{variant_num}"
+    
+    # Then check for separate variant group (SEN7_L75 pattern)
+    if variant == "baseline":
+        filename_variant = match.group("variant")
+        if filename_variant:
+            # Handle patterns like L75, L80, L85, L90 -> lclog75, lclog80, etc.
+            variant_match = re.match(r"L(\d+)", filename_variant, re.IGNORECASE)
+            if variant_match:
+                variant = f"lclog{variant_match.group(1)}"
+            else:
+                variant = filename_variant.lower()
+    
+    # Fall back to path-based variant detection
+    if variant == "baseline" and len(rel_parts) >= 2:
         candidate = rel_parts[1].lower()
         if candidate not in {"baseline", "raw"}:
             variant = candidate
+    
     canonical_filename = (
         f"{date_iso}__{sen}__{variant}__{speed_slug}__{gas_lpm}LPM__PIV{piv_run:02d}.xlsx"
     )
@@ -889,7 +1192,15 @@ def align_sensor_logs(
             output_path=Path(sen) / variant / speed_slug / relative.with_suffix(".parquet").name,
             row_count=0,
         )
-        df = pd.read_excel(workbook)
+        try:
+            df = pd.read_excel(workbook)
+        except (zipfile.BadZipFile, ValueError, Exception) as exc:
+            logger.warning(
+                "Failed to read Excel file %s (may be corrupted): %s. Skipping.",
+                workbook,
+                exc,
+            )
+            continue
         aligned_df, alias_hits, dropped_cols, missing_cols = normalise_columns(df)
         record.alias_columns = alias_hits
         record.dropped_columns = dropped_cols
