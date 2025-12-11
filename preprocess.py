@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build a single HDF5 archive containing only experiments with validated PIV,
+Build a single Zarr archive containing only experiments with validated PIV,
 sensor, and bubble-count data as described in
 data/intermediate/experiments_manifest.csv.
 """
@@ -22,8 +22,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
-import h5py
 import numpy as np
+import zarr
+import zarr.codecs
+import zarr.storage
 import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
@@ -362,7 +364,7 @@ def align_sensor_to_frames(
 
 
 def write_datasets(
-    h5f: h5py.File,
+    root: zarr.Group,
     row: ExperimentRow,
     piv_root: Path,
     sensor_root: Path,
@@ -392,72 +394,82 @@ def write_datasets(
     dy = float(np.mean(np.diff(y_axis)))
     sensor_indices, sensor_time_for_frame = align_sensor_to_frames(sensor_time, frame_time)
 
-    if row.group_path in h5f:
-        del h5f[row.group_path]
-    grp = h5f.create_group(row.group_path)
+    # Zarr uses path-based access - delete existing group if it exists (matching HDF5 behavior)
+    group_path_parts = [p for p in row.group_path.split("/") if p]
+    
+    # Navigate to parent group
+    parent_group = root
+    for part in group_path_parts[:-1]:
+        if part in parent_group:
+            parent_group = parent_group[part]
+        else:
+            parent_group = parent_group.create_group(part)
+    
+    # Delete and recreate the final group if it exists
+    final_part = group_path_parts[-1] if group_path_parts else None
+    if final_part and final_part in parent_group:
+        del parent_group[final_part]
+    
+    if final_part:
+        grp = parent_group.create_group(final_part)
+    else:
+        grp = root
+
+    # Use zstd compression (better than gzip) with native Zarr v3 codec (no warning)
+    compressor = zarr.codecs.ZstdCodec(level=5, checksum=True)
 
     piv_group = grp.create_group("piv")
-    piv_group.create_dataset(
+    piv_group.create_array(
         "u",
         data=u.astype(np.float32),
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
         chunks=(1, row.grid_height, row.grid_width),
     )
-    piv_group.create_dataset(
+    piv_group.create_array(
         "v",
         data=v.astype(np.float32),
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
         chunks=(1, row.grid_height, row.grid_width),
     )
-    piv_group.create_dataset("time_s", data=frame_time.astype(np.float32), compression="gzip")
-    piv_group.create_dataset("x_mm", data=x_axis.astype(np.float32))
-    piv_group.create_dataset("y_mm", data=y_axis.astype(np.float32))
+    piv_group.create_array("time_s", data=frame_time.astype(np.float32), compressors=[compressor])
+    piv_group.create_array("x_mm", data=x_axis.astype(np.float32))
+    piv_group.create_array("y_mm", data=y_axis.astype(np.float32))
 
     sensor_group = grp.create_group("sensor")
     sensor_data = sensor_numeric.to_numpy(dtype=np.float32)
-    sensor_group.create_dataset(
+    sensor_group.create_array(
         "table",
         data=sensor_data,
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
         chunks=(min(256, sensor_data.shape[0]), sensor_data.shape[1]),
     )
-    sensor_group.create_dataset(
-        "columns", data=np.asarray(sensor_df.columns, dtype="S")
-    )
-    sensor_group.create_dataset(
+    # Store column names as a list in attributes (Zarr handles this better than string arrays)
+    sensor_group.attrs["columns"] = list(sensor_df.columns)
+    sensor_group.create_array(
         "time_s",
         data=sensor_time.astype(np.float32),
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
     )
 
     predictions_group = grp.create_group("predictions")
-    predictions_group.create_dataset(
+    predictions_group.create_array(
         "bubble_counts",
         data=sensor_numeric[BUBBLE_COLUMNS].to_numpy(dtype=np.float32),
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
     )
-    predictions_group.create_dataset(
-        "columns",
-        data=np.asarray(BUBBLE_COLUMNS, dtype="S"),
-    )
+    # Store column names as a list in attributes
+    predictions_group.attrs["columns"] = list(BUBBLE_COLUMNS)
 
     alignment_group = grp.create_group("aligned")
-    alignment_group.create_dataset(
+    alignment_group.create_array(
         "sensor_row_index_per_frame",
         data=sensor_indices,
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
     )
-    alignment_group.create_dataset(
+    alignment_group.create_array(
         "sensor_time_for_frame_s",
         data=sensor_time_for_frame.astype(np.float32),
-        compression="gzip",
-        compression_opts=4,
+        compressors=[compressor],
     )
 
     grp.attrs.update(
@@ -704,7 +716,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=textwrap.dedent(
             """\
-            Aggregate validated experiments into a single HDF5 archive. Only runs
+            Aggregate validated experiments into a single Zarr archive. Only runs
             marked as 'included' in data/intermediate/experiments_manifest.csv are processed.
             """
         )
@@ -766,8 +778,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-file",
         type=Path,
-        default=Path("data/processed/all_experiments.h5"),
-        help="Destination HDF5 file (will be overwritten).",
+        default=Path("data/processed/all_experiments.zarr"),
+        help="Destination Zarr archive directory (will be overwritten).",
     )
     parser.add_argument(
         "--coverage-dir",
@@ -789,7 +801,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rebuild-intermediate",
         action="store_true",
-        help="Rebuild normalized/aligned data and manifests before writing HDF5.",
+        help="Rebuild normalized/aligned data and manifests before writing Zarr archive.",
     )
     parser.add_argument(
         "--skip-coverage",
@@ -865,37 +877,51 @@ def main() -> None:
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     if args.refresh and args.output_file.exists():
-        args.output_file.unlink()
+        shutil.rmtree(args.output_file)
 
-    file_mode = "a" if args.output_file.exists() else "w"
-    with h5py.File(args.output_file, file_mode) as h5f:
-        remaining_rows = [
-            row for row in rows if row.group_path not in h5f
-        ]
-        if not remaining_rows:
-            logger.info("All experiments already ingested into %s", args.output_file)
-            return
-        if args.limit is not None:
-            remaining_rows = remaining_rows[: args.limit]
-        logger.info(
-            "Writing %d experiments to %s", len(remaining_rows), args.output_file,
-        )
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("[cyan]Experiments", total=len(remaining_rows))
-            for row in remaining_rows:
-                try:
-                    write_datasets(h5f, row, args.piv_root, args.sensor_root)
-                except Exception as exc:
-                    logger.error("Failed to process %s: %s", row.group_path, exc)
-                    raise
-                progress.advance(task)
+    # Zarr uses directory-based storage (Zarr v3 uses LocalStore instead of DirectoryStore)
+    store = zarr.storage.LocalStore(str(args.output_file))
+    root = zarr.group(store=store, overwrite=False)
+    
+    # Check which experiments are already in the archive
+    remaining_rows = []
+    for row in rows:
+        group_path_parts = [p for p in row.group_path.split("/") if p]
+        current_group = root
+        exists = True
+        for part in group_path_parts:
+            if part in current_group:
+                current_group = current_group[part]
+            else:
+                exists = False
+                break
+        if not exists:
+            remaining_rows.append(row)
+    
+    if not remaining_rows:
+        logger.info("All experiments already ingested into %s", args.output_file)
+        return
+    if args.limit is not None:
+        remaining_rows = remaining_rows[: args.limit]
+    logger.info(
+        "Writing %d experiments to %s", len(remaining_rows), args.output_file,
+    )
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Experiments", total=len(remaining_rows))
+        for row in remaining_rows:
+            try:
+                write_datasets(root, row, args.piv_root, args.sensor_root)
+            except Exception as exc:
+                logger.error("Failed to process %s: %s", row.group_path, exc)
+                raise
+            progress.advance(task)
 
 
 def discover_sensor_workbooks(root: Path) -> Iterable[Path]:
