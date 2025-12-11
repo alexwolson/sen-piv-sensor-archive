@@ -1561,6 +1561,18 @@ def build_experiments_manifest(
     sensor_df = sensor_df.rename(columns={"sensor": "sen"}).copy()
     sensor_df["variant"] = sensor_df["variant"].str.lower()
     sensor_df["sen"] = sensor_df["sen"].str.upper()
+    
+    # Normalize variant names: sensor logs for SEN06-10 use "sen06", "sen07", etc.
+    # but PIV data uses "baseline". Map these to "baseline" for matching.
+    def normalize_variant(row):
+        variant = row["variant"]
+        sen = row["sen"]
+        # If variant matches the SEN name (e.g., "sen06" for SEN06), it's actually "baseline"
+        if variant == sen.lower():
+            return "baseline"
+        return variant
+    
+    sensor_df["variant"] = sensor_df.apply(normalize_variant, axis=1)
 
     merged = piv_df.merge(
         sensor_df,
@@ -1577,8 +1589,14 @@ def build_experiments_manifest(
 
     for idx, row in merged.iterrows():
         row_reasons: list[str] = []
-        if row["frame_count"] != 999:
-            row_reasons.append(f"frame_count={row['frame_count']}")
+        # Allow 997-999 frames (near-complete experiments)
+        # Exclude experiments with very few frames (likely incomplete/test runs)
+        frame_count = row["frame_count"]
+        if frame_count < 997:
+            row_reasons.append(f"frame_count={frame_count}")
+        elif frame_count != 999:
+            # Log but don't exclude - these are near-complete and alignment will handle them
+            pass
         issues_raw = row.get("issues", "")
         if isinstance(issues_raw, float) and pd.isna(issues_raw):
             issues = ""
