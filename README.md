@@ -27,8 +27,8 @@
 ## Aligning Sensor Logs With PIV Frames
 1. Load workbook (`pd.read_excel`) and clean metadata rows.
 2. Extract the active window: `piv_window = df[df["PIV_ON"]]`, or slice between stored start/end times.
-3. Align three sensor samples per PIV frame (as `preprocess.py` expects) using integer division of indices or by following `aligned/frame_idx` in generated HDF5 outputs.
-4. Persist cleaned slices as Parquet/HDF5 alongside velocity arrays; store alignment metadata for reproducibility.
+3. Align three sensor samples per PIV frame (as `preprocess.py` expects) using integer division of indices or by following `aligned/frame_idx` in generated Zarr outputs.
+4. Persist cleaned slices as Parquet alongside velocity arrays; store alignment metadata for reproducibility in Zarr archive.
 
 ## Data Directory Layout
 All datasets now live under the `data/` directory:
@@ -47,14 +47,14 @@ data/
 │   ├── piv_velocity_manifest.csv
 │   └── experiments_manifest.csv  # merged sensor+PIV coverage
 └── processed/
-    ├── all_experiments.h5        # consolidated archive
+    ├── all_experiments.zarr/     # consolidated Zarr archive (directory)
     └── coverage/                 # per-SEN coverage reports
 ```
 
 ## Processing Workflow
-1. Run `uv run python preprocess.py --rebuild-intermediate` to (re)generate canonical sensor logs, aligned Parquet windows, canonical PIV directories, the merged manifest, SEN coverage reports, and the consolidated HDF5 archive.
-2. Use `--limit` when re-running the HDF5 assembly in a constrained environment to process a subset of runs per invocation (the script skips completed groups automatically).
-3. All manifests live under `data/intermediate/` and are kept in sync with the HDF5 output; coverage reports land in `data/processed/coverage/`.
+1. Run `uv run python preprocess.py --rebuild-intermediate` to (re)generate canonical sensor logs, aligned Parquet windows, canonical PIV directories, the merged manifest, SEN coverage reports, and the consolidated Zarr archive.
+2. Use `--limit` when re-running the Zarr assembly in a constrained environment to process a subset of runs per invocation (the script skips completed groups automatically).
+3. All manifests live under `data/intermediate/` and are kept in sync with the Zarr output; coverage reports land in `data/processed/coverage/`.
 
 ### Preprocessing Pipeline
 `preprocess.py` now orchestrates the full flow:
@@ -63,18 +63,18 @@ data/
 2. Aligns every workbook into a consistent Parquet schema under `data/intermediate/sensor_logs_aligned/` with the accompanying manifest.
 3. Normalises PIV CSV directories into `data/intermediate/piv_velocity/` and records metadata in `piv_velocity_manifest.csv`.
 4. Builds the merged experiments manifest (`data/intermediate/experiments_manifest.csv`) and regenerates coverage reports (`data/processed/coverage/`).
-5. Writes the consolidated HDF5 archive at `data/processed/all_experiments.h5`.
+5. Writes the consolidated Zarr archive at `data/processed/all_experiments.zarr/`.
 
 Use `uv run python preprocess.py --rebuild-intermediate` to force regeneration of all intermediate artefacts before creating the final archive.
 
-To rebuild everything from scratch (including the final HDF5), run:
+To rebuild everything from scratch (including the final Zarr archive), run:
 
 ```
 uv run python preprocess.py --rebuild-intermediate --refresh
 ```
 
 ## End-State Consolidation Plan
-Goal: publish a single HDF5 archive containing only experiments that have verified PIV velocity frames, aligned sensor traces (including bubble-count predictions), and consistent metadata.
+Goal: publish a single Zarr archive containing only experiments that have verified PIV velocity frames, aligned sensor traces (including bubble-count predictions), and consistent metadata.
 
 1. **Complete Ingestion**
    - Download every SEN’s PIV sequences into `data/raw/piv_velocity_raw/`, verifying each run has the full 999-frame suite with no missing indices.
@@ -86,15 +86,15 @@ Goal: publish a single HDF5 archive containing only experiments that have verifi
    - Check coordinate geometry: grid dimensions must be 30×22 with consistent physical spacing; capture per-run deltas if observed.
    - Align time windows: the `PIV_ON` boolean and `PIV Start/End Time` must match the PIV CSV timestamp range (0.003333 s increments). Flag discrepancies beyond tolerance and exclude the run until resolved.
    - Ensure monotonic `time[s]` in sensors and continuous frame indices in PIV; a gap or duplicate should mark the run as invalid.
-4. **HDF5 Assembly**
-   - Design a hierarchy such as `/runs/<SEN>/<speed>/<gas>/PIV##/{piv_data, sensor_data, metadata}` with chunking along time and GZIP compression.
+4. **Zarr Archive Assembly**
+   - Design a hierarchy such as `/runs/<SEN>/<speed>/<gas>/PIV##/{piv_data, sensor_data, metadata}` with chunking along time and zstd compression (via Blosc).
    - Store the raw velocity tensors, aligned sensor tables, bubble-count predictions, and alignment metadata together with manifest attributes (date, variant, acquisition timestamps, processing versions).
 5. **Quality Gates & Releases**
    - Run validation scripts as part of the build; fail the job if a run lacks any data source or fails alignment tests.
    - Produce coverage reports under `data/processed/coverage/` for each SEN, tracking missing components until the archive is complete.
-   - Version the HDF5 output (checksums, release tags) so collaborators can pin analyses to specific data snapshots.
+   - Version the Zarr output (checksums, release tags) so collaborators can pin analyses to specific data snapshots.
 6. **Documentation & Onboarding**
-   - Update this README (and any supplemental docs) with instructions for adding new experiments, rebuilding the archive, and interpreting HDF5 contents.
+   - Update this README (and any supplemental docs) with instructions for adding new experiments, rebuilding the archive, and interpreting Zarr contents.
    - Encourage scripted ingestion only—avoid manual edits to PIV CSVs or sensor workbooks to maintain reproducibility.
 
 ## Contributor Guide
